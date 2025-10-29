@@ -3,6 +3,8 @@ from __future__ import annotations
 import uuid
 from typing import Dict, Any, List
 import re
+import unicodedata
+from difflib import get_close_matches
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -49,25 +51,48 @@ def detect_intent(state: AgentState) -> AgentState:
     state["intent"] = intent
     return state
 
+# Regex más tolerantes (sin \b) y case-insensitive
+ORDER_REGEX = re.compile(r"(EC-\d{3,})", re.IGNORECASE)
+SKU_REGEX   = re.compile(r"([A-Z]{2,}-[A-Z0-9]+(?:-[A-Z0-9]+)*)", re.IGNORECASE)
+DAMAGE_WORDS = {"dañado", "daniado", "defectuoso", "roto", "golpeado", "averiado"}
+
+def _normalize_text(s: str) -> str:
+    # 1) Normaliza acentos/compatibilidad Unicode
+    s = unicodedata.normalize("NFKC", s)
+    # 2) Unifica guiones (reemplaza en/em dash por '-')
+    s = s.replace("–", "-").replace("—", "-").replace("−", "-")
+    # 3) Espacios raros a espacios normales
+    s = s.replace("\u00A0", " ")
+    return s
 
 def slot_filling(state: AgentState) -> AgentState:
     slots = state.get("slots") or {}
-    msg = state.get("user_msg") or ""
+    raw = state.get("user_msg") or ""
+    msg = _normalize_text(raw)
 
     # order_id
     if "order_id" not in slots:
         m = ORDER_REGEX.search(msg)
         if m:
-            slots["order_id"] = m.group(0).upper()
+            slots["order_id"] = m.group(1).upper().rstrip(".,;:!?")  # corta puntuación final
 
     # product_sku
     if "product_sku" not in slots:
         m = SKU_REGEX.search(msg)
         if m:
-            slots["product_sku"] = m.group(0).upper()
+            slots["product_sku"] = m.group(1).upper().rstrip(".,;:!?")
 
-    # condition por defecto, el LLM lo confirmará si el usuario lo sabe
-    slots.setdefault("condition", "sealed")
+    # condition por defecto y auto-marca "defective" si detecta palabras de daño
+    msg_lower = msg.lower()
+    if "dañado" in msg_lower or "defectuoso" in msg_lower:
+        slots["condition"] = "defective"
+    elif "abierto" in msg_lower or "lo abrí" in msg_lower or "lo abri" in msg_lower:
+        slots["condition"] = "opened"
+    else:
+        slots.setdefault("condition", "sealed")
+    low = msg.lower()
+    if any(w in low for w in DAMAGE_WORDS):
+        slots["condition"] = "defective"
 
     state["slots"] = slots
     return state
@@ -103,7 +128,15 @@ def eligibility_check(state: AgentState) -> AgentState:
     # validar que el sku exista en la orden
     categories = {it["sku"]: it.get("category", "") for it in order.get("items", [])}
     if sku not in categories:
-        state["eligibility"] = {"eligible": False, "reason": "SKU_NOT_IN_ORDER"}
+        in_order = list(categories.keys())
+        # fuzzy opcional (p.ej. sugiere el más parecido si existe)
+        close = get_close_matches(sku, in_order, n=1, cutoff=0.6)
+        state["eligibility"] = {
+            "eligible": False,
+            "reason": "SKU_NOT_IN_ORDER",
+            "suggested_skus": in_order,
+            "closest_match": close[0] if close else None,
+        }
         return state
 
     res = check_eligibility.invoke({
@@ -114,7 +147,6 @@ def eligibility_check(state: AgentState) -> AgentState:
     })
     state["eligibility"] = res
     return state
-
 
 def maybe_label_or_deny(state: AgentState) -> AgentState:
     elig = state.get("eligibility") or {}
@@ -128,7 +160,6 @@ def maybe_label_or_deny(state: AgentState) -> AgentState:
 
 
 def answer_return(state: AgentState) -> AgentState:
-    """Redacción final para flujo de devoluciones (con o sin etiqueta)."""
     llm = ChatOpenAI(model=OPENAI_CHAT_MODEL, temperature=float(OPENAI_TEMPERATURE))
     snippets = state.get("policy_snippets") or []
     cites = summarize_sources(snippets)
@@ -138,9 +169,14 @@ def answer_return(state: AgentState) -> AgentState:
     elig = state.get("eligibility") or {}
     label = state.get("label_url")
 
-    missing = _needs_more_slots(slots)
-    # Si faltan datos críticos, que el propio LLM pida la info (una sola vez)
-    need_clarify = bool(missing) or not has_policy_evidence(snippets) or not order
+    # Detecta caso de SKU_NOT_IN_ORDER para configurar la aclaración
+    reason = (elig or {}).get("reason")
+    in_order_skus = [it["sku"] for it in (order.get("items", []) if order else [])]
+    closest = (elig or {}).get("closest_match")
+    missing = []
+    if not slots.get("order_id"): missing.append("order_id")
+    if not slots.get("product_sku"): missing.append("product_sku")
+    need_clarify = bool(missing) or not has_policy_evidence(snippets) or not order or reason == "SKU_NOT_IN_ORDER"
 
     tmpl = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
@@ -149,12 +185,15 @@ def answer_return(state: AgentState) -> AgentState:
          "Contexto de políticas (resumen): {cites}\n\n"
          "Intent: {intent}\nSlots: {slots}\nOrder: {order}\nEligibility: {elig}\nLabel: {label}\n"
          "Necesita_aclaracion: {need_clarify}\n"
-         "Slots_faltantes: {missing}\n\n"
+         "Slots_faltantes: {missing}\n"
+         "Sku_en_orden: {in_order_skus}\n"
+         "Sugerencia_cercana: {closest}\n\n"
          "Instrucciones:\n"
-         "1) Si Necesita_aclaracion es True, pide con amabilidad SOLO lo necesario (order_id o product_sku) "
-         "   y no asumas decisión de elegibilidad aún.\n"
-         "2) Si hay evidencia suficiente y elegible, da pasos claros y muestra la URL de etiqueta.\n"
-         "3) Si no es elegible, explica la razón (ventana/categoría) y ofrece alternativas.\n"
+         "1) Si Necesita_aclaracion es True por 'SKU_NOT_IN_ORDER', NO niegues; pide confirmar el SKU "
+         "   mostrando explícitamente las opciones válidas del pedido (Sku_en_orden). "
+         "   Si Sugerencia_cercana existe, proponla como opción probable.\n"
+         "2) Si luego resulta elegible, da pasos claros y muestra la URL de etiqueta.\n"
+         "3) Si no es elegible por políticas (ventana/categoría), explica la razón y ofrece alternativas.\n"
          "4) Cierra con tono empático y profesional, citando brevemente las fuentes (archivo + fecha).")
     ])
     msg = tmpl.format_messages(
@@ -167,6 +206,8 @@ def answer_return(state: AgentState) -> AgentState:
         label=label,
         need_clarify=str(need_clarify),
         missing=", ".join(missing) if missing else "—",
+        in_order_skus=", ".join(in_order_skus) if in_order_skus else "—",
+        closest=closest or "—",
     )
     out = llm.invoke(msg)
     state["final_answer"] = out.content
