@@ -1,6 +1,7 @@
 
 from __future__ import annotations
-from typing import List, Dict, Any, Optional, Tuple, TypedDict
+from typing import List, Dict, Any, Optional, Tuple
+from typing_extensions import TypedDict
 from datetime import datetime, timedelta
 from pydantic import BaseModel, Field, field_validator
 from langchain.tools import tool
@@ -40,7 +41,6 @@ class GenerateReturnLabelOutput(TypedDict, total=False):
 # =========================
 # Tool 1: RAG Search
 # =========================
-
 class RagSearchInput(BaseModel):
     """
     Parámetros de entrada para la búsqueda RAG.
@@ -52,10 +52,7 @@ class RagSearchInput(BaseModel):
     """
     query: str = Field(..., description="Consulta del cliente")
     k: int = Field(6, ge=1, le=20, description="Número de fragmentos a recuperar (1..20)")
-    doc_type_filter: Optional[List[str]] = Field(
-        None,
-        description="Filtro por doc_type: e.g. ['policy', 'faq']"
-    )
+    doc_type_filter: Optional[List[str]] = Field(None, description="Filtro por doc_type: e.g. ['policy', 'faq']")
 
     @field_validator("doc_type_filter")
     @classmethod
@@ -65,8 +62,11 @@ class RagSearchInput(BaseModel):
         return [str(x).strip().lower() for x in v if str(x).strip()]
 
 
+
 @tool("rag_search", args_schema=RagSearchInput, return_direct=False)
-def rag_search(args: RagSearchInput) -> RagSearchOutput:
+def rag_search(query: str,
+    k: int = 6,
+    doc_type_filter: Optional[List[str]] = None) -> RagSearchOutput:
     """
     📚 RAG Search — Recupera evidencia antes de decidir.
 
@@ -109,11 +109,10 @@ def rag_search(args: RagSearchInput) -> RagSearchOutput:
         - Si no hay resultados, retorna {"snippets": []}.
     """
     filt = None
-    if args.doc_type_filter:
-        # LangChain -> Pinecone: filtro estilo "$in" para doc_type
-        filt = {"doc_type": {"$in": args.doc_type_filter}}
+    if doc_type_filter:
+        filt = {"doc_type": {"$in": doc_type_filter}}
 
-    res = answer(args.query, k=args.k, metadata_filter=filt, temperature=0.0)
+    res = answer(query, k=k, metadata_filter=filt, temperature=0.0)
     docs = res.get("source_documents", []) or []
 
     out: RagSearchOutput = {"snippets": []}
@@ -156,7 +155,7 @@ _FAKE_ORDERS: Dict[str, Dict[str, Any]] = {
 }
 
 @tool("get_order_info", args_schema=GetOrderInfoInput, return_direct=False)
-def get_order_info(args: GetOrderInfoInput) -> GetOrderInfoOutput:
+def get_order_info(order_id: str) -> GetOrderInfoOutput:
     """
     📦 Get Order Info — Fuente de verdad transaccional.
 
@@ -178,7 +177,7 @@ def get_order_info(args: GetOrderInfoInput) -> GetOrderInfoOutput:
         - Implementación mock para la entrega. Sustituible por un conector real (ERP/CMS).
         - Es la **única fuente** para validar SKU en pedido y categoría del producto.
     """
-    order = _FAKE_ORDERS.get(args.order_id)
+    order = _FAKE_ORDERS.get(order_id)
     if not order:
         return {"found": False, "reason": "ORDER_NOT_FOUND"}
     return {"found": True, "order": order}
@@ -214,7 +213,12 @@ class CheckEligibilityInput(BaseModel):
 
 
 @tool("check_eligibility", args_schema=CheckEligibilityInput, return_direct=False)
-def check_eligibility(args: CheckEligibilityInput) -> CheckEligibilityOutput:
+def check_eligibility(
+    purchase_date: str,
+    category: str,
+    condition: str,
+    policy_snippets: List[RagSnippet],
+) -> CheckEligibilityOutput:
     """
     ✅ Eligibility Check — Reglas claras, decisiones auditables.
 
@@ -246,43 +250,20 @@ def check_eligibility(args: CheckEligibilityInput) -> CheckEligibilityOutput:
           "policy_snippets": [...]
         })
     """
-    purchase = datetime.fromisoformat(args.purchase_date).date()
+    purchase = datetime.fromisoformat(purchase_date).date()
     days_elapsed = (datetime.utcnow().date() - purchase).days
     window_days = 30
 
-    # Defecto de fábrica → siempre elegible (canal garantía)
-    if args.condition == "defective":
-        return {
-            "eligible": True,
-            "reason": "DEFECTIVE_EXEMPTION",
-            "days_elapsed": days_elapsed,
-            "window_days": window_days,
-        }
+    if condition == "defective":
+        return {"eligible": True, "reason": "DEFECTIVE_EXEMPTION", "days_elapsed": days_elapsed, "window_days": window_days}
 
-    # Exclusión por higiene abierto
-    if args.category.strip().lower() == "higiene" and args.condition == "opened":
-        return {
-            "eligible": False,
-            "reason": "OPENED_HYGIENE_EXCLUDED",
-            "days_elapsed": days_elapsed,
-            "window_days": window_days,
-        }
+    if category.strip().lower() == "higiene" and condition == "opened":
+        return {"eligible": False, "reason": "OPENED_HYGIENE_EXCLUDED", "days_elapsed": days_elapsed, "window_days": window_days}
 
-    # Ventana estándar
     if days_elapsed <= window_days:
-        return {
-            "eligible": True,
-            "reason": "WITHIN_WINDOW",
-            "days_elapsed": days_elapsed,
-            "window_days": window_days,
-        }
+        return {"eligible": True, "reason": "WITHIN_WINDOW", "days_elapsed": days_elapsed, "window_days": window_days}
     else:
-        return {
-            "eligible": False,
-            "reason": "WINDOW_EXPIRED",
-            "days_elapsed": days_elapsed,
-            "window_days": window_days,
-        }
+        return {"eligible": False, "reason": "WINDOW_EXPIRED", "days_elapsed": days_elapsed, "window_days": window_days}
 
 
 # =========================
@@ -306,7 +287,7 @@ _LABEL_STORE: Dict[Tuple[str, str], str] = {}
 
 
 @tool("generate_return_label", args_schema=GenerateReturnLabelInput, return_direct=False)
-def generate_return_label(args: GenerateReturnLabelInput) -> GenerateReturnLabelOutput:
+def generate_return_label(order_id: str, product_sku: str) -> GenerateReturnLabelOutput:
     """
     🏷️ Generate Return Label — Misma entrada, misma etiqueta.
 
@@ -327,7 +308,7 @@ def generate_return_label(args: GenerateReturnLabelInput) -> GenerateReturnLabel
           "product_sku": "ECO-SOAP-500"
         })
     """
-    key = (args.order_id, args.product_sku)
+    key = (order_id, product_sku)
     if key not in _LABEL_STORE:
-        _LABEL_STORE[key] = f"https://labels.ecomarket.local/{args.order_id}/{args.product_sku}"
+        _LABEL_STORE[key] = f"https://labels.ecomarket.local/{order_id}/{product_sku}"
     return {"label_url": _LABEL_STORE[key]}

@@ -1,5 +1,6 @@
 # src/agent/graph.py
 from __future__ import annotations
+import uuid
 from typing import Dict, Any, List
 import re
 from langchain_openai import ChatOpenAI
@@ -178,8 +179,7 @@ def generic_rag_answer(state: AgentState) -> AgentState:
     usa el RAG directo (FAQs + políticas) y retorna respuesta con fuentes.
     """
     res = rag_direct_answer(state.get("user_msg") or "", k=5, metadata_filter=None, temperature=0.0)
-    # El chain ya devuelve respuesta final y fuentes formateadas
-    state["final_answer"] = res.get("answer") or "No encuentro suficiente información en la base."
+    state["final_answer"] = res.get("result") or "No encuentro suficiente información en la base."
     return state
 
 
@@ -231,17 +231,34 @@ def build_graph():
     return graph.compile(checkpointer=memory)
 
 
-def run_agent(user_msg: str) -> Dict[str, Any]:
+def run_agent(user_msg: str, thread_id: str | None = None) -> Dict[str, Any]:
     app = build_graph()
     state: AgentState = {
         "user_msg": user_msg,
         "slots": {},
         "policy_snippets": [],
     }
-    out = app.invoke(state)
+    # genera uno si no te pasan
+    thread_id = thread_id or f"session-{uuid.uuid4()}"
+    out = app.invoke(state, config={"configurable": {"thread_id": thread_id}})
     return {
         "answer": out.get("final_answer"),
         "label_url": out.get("label_url"),
         "intent": out.get("intent"),
         "slots": out.get("slots"),
+        "thread_id": thread_id,
     }
+if __name__ == "__main__":
+    print("EcoMarket — Agent demo (Ctrl+C para salir)\n")
+    demo_thread = "cli-session-1"  # fijo para conservar contexto en la sesión
+    while True:
+        try:
+            msg = input("> ")
+        except KeyboardInterrupt:
+            break
+        out = run_agent(msg, thread_id=demo_thread)
+        print("\n— Intent:", out.get("intent"))
+        print("— Slots:", out.get("slots"))
+        if out.get("label_url"):
+            print("— Label:", out["label_url"])
+        print("\nRespuesta:\n", out.get("answer"), "\n")
