@@ -1,0 +1,26 @@
+# === Núcleo del agente y entorno ===
+python-dotenv
+pydantic
+typing-extensions
+
+# === LangChain + LangGraph ===
+langchain
+langchain-core
+langchain-openai
+langgraph
+
+# === Pinecone SDK ===
+pinecone-client
+
+# === OpenAI + embeddings ===
+openai
+tiktoken
+
+# === RAG pipeline ===
+pandas
+numpy
+PyPDF2
+
+# === CLI y UI (opcional para debugging o interfaz) ===
+streamlit
+gradio
