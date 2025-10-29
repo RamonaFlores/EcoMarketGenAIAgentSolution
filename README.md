@@ -4,6 +4,8 @@
 
 https://ecoassist-hub.lovable.app
 
+Toda la parte teórica del proyecto se encuentra dentro del folder docs :) !! Gracias profe
+
 Construye un agente de soporte “con criterio”: entiende intenciones, busca evidencia real (RAG con Pinecone), aplica reglas auditables (LangGraph + Tools) y responde con empatía. Incluye CLI, API web y UI opcional con Gradio.
 
 ---
