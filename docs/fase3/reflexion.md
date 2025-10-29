@@ -1,4 +1,4 @@
-### 🧭 Fase 3: Análisis Crítico y Propuestas de Mejora
+###  Fase 3: Análisis Crítico y Propuestas de Mejora
 
 ### Análisis de Seguridad y Ética
 
