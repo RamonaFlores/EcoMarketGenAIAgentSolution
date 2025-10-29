@@ -1,5 +1,6 @@
 # src/agent/graph.py
 from __future__ import annotations
+from ..config import DEBUG_MODE
 import uuid
 from typing import Dict, Any, List
 import re
@@ -160,59 +161,61 @@ def maybe_label_or_deny(state: AgentState) -> AgentState:
 
 
 def answer_return(state: AgentState) -> AgentState:
+    """Redacción final para flujo de devoluciones (con o sin etiqueta) + UX mejorada."""
     llm = ChatOpenAI(model=OPENAI_CHAT_MODEL, temperature=float(OPENAI_TEMPERATURE))
+
     snippets = state.get("policy_snippets") or []
     cites = summarize_sources(snippets)
+    policy_snip = _extract_policy_snippet(snippets)  # mini-snippet real
     intent = state.get("intent")
     slots = state.get("slots") or {}
     order = (state.get("order_info") or {}).get("order")
     elig = state.get("eligibility") or {}
     label = state.get("label_url")
 
-    # Detecta caso de SKU_NOT_IN_ORDER para configurar la aclaración
-    reason = (elig or {}).get("reason")
-    in_order_skus = [it["sku"] for it in (order.get("items", []) if order else [])]
-    closest = (elig or {}).get("closest_match")
+    # ¿Faltan datos críticos o evidencia/orden?
     missing = []
     if not slots.get("order_id"): missing.append("order_id")
     if not slots.get("product_sku"): missing.append("product_sku")
-    need_clarify = bool(missing) or not has_policy_evidence(snippets) or not order or reason == "SKU_NOT_IN_ORDER"
+    need_clarify = bool(missing) or not has_policy_evidence(snippets) or not order
+
+    # Telemetría mínima (solo si DEBUG_MODE=true)
+    _log_decision(state)
 
     tmpl = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         ("human",
          "Cliente: {user}\n\n"
-         "Contexto de políticas (resumen): {cites}\n\n"
+         "Contexto de políticas (resumen): {cites}\n"
+         "Fragmento de política (texto real, abreviado): \"{policy_snip}\"\n\n"
          "Intent: {intent}\nSlots: {slots}\nOrder: {order}\nEligibility: {elig}\nLabel: {label}\n"
          "Necesita_aclaracion: {need_clarify}\n"
-         "Slots_faltantes: {missing}\n"
-         "Sku_en_orden: {in_order_skus}\n"
-         "Sugerencia_cercana: {closest}\n\n"
-         "Instrucciones:\n"
-         "1) Si Necesita_aclaracion es True por 'SKU_NOT_IN_ORDER', NO niegues; pide confirmar el SKU "
-         "   mostrando explícitamente las opciones válidas del pedido (Sku_en_orden). "
-         "   Si Sugerencia_cercana existe, proponla como opción probable.\n"
-         "2) Si luego resulta elegible, da pasos claros y muestra la URL de etiqueta.\n"
-         "3) Si no es elegible por políticas (ventana/categoría), explica la razón y ofrece alternativas.\n"
-         "4) Cierra con tono empático y profesional, citando brevemente las fuentes (archivo + fecha).")
+         "Slots_faltantes: {missing}\n\n"
+         "Instrucciones de redacción:\n"
+         "1) Si Necesita_aclaracion es True, solicita SOLO los datos faltantes (order_id y/o product_sku) con tono amable; no decidas elegibilidad aún.\n"
+         "2) Si eligibilidad es True, explica explícitamente por qué (regla aplicada: WITHIN_WINDOW o DEFECTIVE_EXEMPTION),\n"
+         "   ofrece pasos claros (generar etiqueta, empacar, enviar en X días) e incluye la URL de etiqueta si existe.\n"
+         "3) Si eligibilidad es False, explica la razón con precisión (ej. OPENED_HYGIENE_EXCLUDED o WINDOW_EXPIRED),\n"
+         "   incluye una alternativa concreta (p. ej., soporte humano, cambio por categoría no restringida, cupón, guía de selección) y tono empático.\n"
+         "4) Cierra siempre citando brevemente las fuentes en una línea: {cites}.\n"
+         "5) Mantén la respuesta corta, útil y con bullets cuando convenga.\n")
     ])
+
     msg = tmpl.format_messages(
         user=state.get("user_msg") or "",
         cites=cites,
+        policy_snip=policy_snip or "—",
         intent=intent,
         slots=slots,
         order=order,
         elig=elig,
-        label=label,
-        need_clarify=str(need_clarify),
+        label=label or "—",
+        need_clarify="True" if need_clarify else "False",
         missing=", ".join(missing) if missing else "—",
-        in_order_skus=", ".join(in_order_skus) if in_order_skus else "—",
-        closest=closest or "—",
     )
     out = llm.invoke(msg)
     state["final_answer"] = out.content
     return state
-
 
 def generic_rag_answer(state: AgentState) -> AgentState:
     """
@@ -289,6 +292,34 @@ def run_agent(user_msg: str, thread_id: str | None = None) -> Dict[str, Any]:
         "slots": out.get("slots"),
         "thread_id": thread_id,
     }
+def _extract_policy_snippet(snippets: list[dict], max_chars: int = 220) -> str:
+    """
+    Devuelve un mini-snippet de la primera política disponible.
+    Prioriza doc_type='policy'. Si no hay, retorna cadena vacía.
+    """
+    if not snippets:
+        return ""
+    # priorizar policy
+    snippets_sorted = sorted(
+        snippets, key=lambda s: (s.get("doc_type") != "policy", s.get("last_updated") or ""), reverse=False
+    )
+    txt = (snippets_sorted[0].get("text") or "").strip().replace("\n", " ")
+    return txt[:max_chars] + ("…" if len(txt) > max_chars else "")
+
+def _log_decision(state: dict) -> None:
+    """Imprime telemetría mínima si DEBUG_MODE=true."""
+    if not DEBUG_MODE:
+        return
+    elig = state.get("eligibility") or {}
+    slots = state.get("slots") or {}
+    order = (state.get("order_info") or {}).get("order") or {}
+    print("[DECISION] reason:", elig.get("reason"),
+          "| eligible:", elig.get("eligible"),
+          "| order_id:", slots.get("order_id"),
+          "| sku:", slots.get("product_sku"),
+          "| days_elapsed:", elig.get("days_elapsed"),
+          "| category:", next((i.get("category") for i in order.get("items", [])
+                               if i.get("sku")==slots.get("product_sku")), None))
 if __name__ == "__main__":
     print("EcoMarket — Agent demo (Ctrl+C para salir)\n")
     demo_thread = "cli-session-1"  # fijo para conservar contexto en la sesión

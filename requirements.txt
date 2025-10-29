@@ -24,3 +24,8 @@ PyPDF2
 # === CLI y UI (opcional para debugging o interfaz) ===
 streamlit
 gradio
+
+
+# === FastAPI ===
+fastapi
+uvicorn
